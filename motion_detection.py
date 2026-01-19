@@ -813,6 +813,7 @@ class MultiHypothesisDetector:
                 'centroid': best_det['centroid'],
                 'area': best_det['area'],
                 'scale': best_det.get('scale', 1.0),
+                'sigma': best_det.get('sigma', 3.0),  # Primary sigma that detected this
                 'confidence': confidence,
                 'num_hypotheses': num_hypotheses,
                 'sigmas_detected': sigmas_detected,
@@ -832,18 +833,25 @@ def tracks_to_detections(tracks: List[Track]) -> List[Dict]:
             'centroid': track.get_current_centroid(),
             'area': track.last_detection['area'] if track.last_detection else 0,
             'scale': track.preferred_scale,
+            'sigma': track.last_detection.get('sigma', 3.0) if track.last_detection else 3.0,
+            'confidence': track.last_detection.get('confidence', track.confidence) if track.last_detection else track.confidence,
             'track_id': track.track_id,
             'track_status': track.status,
             'track_confidence': track.confidence,
             'track_hits': track.hits,
             'track_misses': track.misses,
             'track_age': track.age,
-            'is_coasting': track.status == 'coasting'
+            'is_coasting': track.status == 'coasting',
+            'velocity_x': 0.0,
+            'velocity_y': 0.0,
+            'speed': 0.0
         }
 
         if track.kalman:
             vx, vy = track.kalman.get_velocity()
             det['velocity'] = (vx, vy)
+            det['velocity_x'] = vx
+            det['velocity_y'] = vy
             det['speed'] = track.kalman.get_speed()
 
         detections.append(det)
@@ -1024,7 +1032,7 @@ def scale_detections_to_original(detections: List[Dict], scale: float) -> List[D
             'scale': scale
         }
 
-        for key in ['confidence', 'num_hypotheses', 'sigmas_detected']:
+        for key in ['confidence', 'num_hypotheses', 'sigmas_detected', 'sigma', 'total_weight']:
             if key in det:
                 scaled_det[key] = det[key]
 
@@ -1331,10 +1339,13 @@ def process_video(input_path: str, config: Config, debug: bool = False,
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         csv_file = open(csv_path, 'w', newline='', encoding='utf-8')
         csv_writer = csv.writer(csv_file)
-        # Write header
+        # Write header with all detection fields
         csv_writer.writerow([
-            'frame_id', 'centroid_x', 'centroid_y',
-            'bbox_x', 'bbox_y', 'bbox_width', 'bbox_height'
+            'frame_id', 'track_id', 'centroid_x', 'centroid_y',
+            'bbox_x', 'bbox_y', 'bbox_width', 'bbox_height',
+            'scale', 'sigma', 'confidence', 'area',
+            'track_status', 'is_coasting', 'velocity_x', 'velocity_y', 'speed',
+            'track_age', 'track_hits', 'track_misses'
         ])
 
     scale_detection_counts = {}
@@ -1393,25 +1404,51 @@ def process_video(input_path: str, config: Config, debug: bool = False,
                             cx, cy = det['centroid']
                             bx, by, bw, bh = det['bbox']
                             csv_writer.writerow([
-                                frame_count,  # frame_id (1-indexed)
-                                cx,           # centroid_x
-                                cy,           # centroid_y
-                                bx,           # bbox_x
-                                by,           # bbox_y
-                                bw,           # bbox_width
-                                bh            # bbox_height
+                                frame_count,                              # frame_id (1-indexed)
+                                det.get('track_id', ''),                  # track_id
+                                cx,                                       # centroid_x
+                                cy,                                       # centroid_y
+                                bx,                                       # bbox_x
+                                by,                                       # bbox_y
+                                bw,                                       # bbox_width
+                                bh,                                       # bbox_height
+                                det.get('scale', ''),                     # scale
+                                det.get('sigma', ''),                     # sigma
+                                f"{det.get('confidence', 0):.4f}" if 'confidence' in det else '',  # confidence
+                                det.get('area', ''),                      # area
+                                det.get('track_status', ''),              # track_status
+                                det.get('is_coasting', ''),               # is_coasting
+                                f"{det.get('velocity_x', 0):.2f}" if 'velocity_x' in det else '',  # velocity_x
+                                f"{det.get('velocity_y', 0):.2f}" if 'velocity_y' in det else '',  # velocity_y
+                                f"{det.get('speed', 0):.2f}" if 'speed' in det else '',            # speed
+                                det.get('track_age', ''),                 # track_age
+                                det.get('track_hits', ''),                # track_hits
+                                det.get('track_misses', '')               # track_misses
                             ])
                             total_csv_rows += 1
                     else:
-                        # No detections for this frame - write row with null values
+                        # No detections for this frame - write row with null values for all fields
                         csv_writer.writerow([
                             frame_count,  # frame_id (1-indexed)
+                            '',           # track_id (null)
                             '',           # centroid_x (null)
                             '',           # centroid_y (null)
                             '',           # bbox_x (null)
                             '',           # bbox_y (null)
                             '',           # bbox_width (null)
-                            ''            # bbox_height (null)
+                            '',           # bbox_height (null)
+                            '',           # scale (null)
+                            '',           # sigma (null)
+                            '',           # confidence (null)
+                            '',           # area (null)
+                            '',           # track_status (null)
+                            '',           # is_coasting (null)
+                            '',           # velocity_x (null)
+                            '',           # velocity_y (null)
+                            '',           # speed (null)
+                            '',           # track_age (null)
+                            '',           # track_hits (null)
+                            ''            # track_misses (null)
                         ])
                         total_csv_rows += 1
 
@@ -1514,8 +1551,10 @@ Examples:
 
 Supported image formats for folders: .bmp, .png, .jpg, .jpeg, .tif, .tiff
 
-CSV output format:
-    frame_id,centroid_x,centroid_y,bbox_x,bbox_y,bbox_width,bbox_height
+CSV output columns:
+    frame_id, track_id, centroid_x, centroid_y, bbox_x, bbox_y, bbox_width, bbox_height,
+    scale, sigma, confidence, area, track_status, is_coasting, velocity_x, velocity_y,
+    speed, track_age, track_hits, track_misses
         """
     )
 
@@ -1527,7 +1566,7 @@ CSV output format:
     parser.add_argument('--output-dir', '-o', default='data/multiscale_ema_frames',
                         help='Output directory for processed frames (default: data/multiscale_ema_frames)')
     parser.add_argument('--csv', '-c', default=None,
-                        help='Output CSV file path for detections (columns: frame_id,centroid_x,centroid_y,bbox_x,bbox_y,bbox_width,bbox_height)')
+                        help='Output CSV file path for detections (includes all tracking and detection metadata)')
     parser.add_argument('--motion-frames', '-m', action='store_true',
                         help='Save output frames with detection visualizations to output directory')
     parser.add_argument('--debug', '-d', action='store_true',
