@@ -234,7 +234,7 @@ DEFAULT_CONFIG = {
     # Base parameters (for 1.0x scale)
     'base_threshold_sigma': 3.0,
     'base_morph_kernel_size': 3,
-    'base_min_area': 100,
+    'base_min_area': 150,
     'base_max_area': 50000,
 
     # Scale adjustment factors
@@ -251,7 +251,7 @@ DEFAULT_CONFIG = {
 
     # Track Coasting parameters
     'enable_tracking': True,
-    'track_min_hits': 3,
+    'track_min_hits': 4,
     'track_max_coast_age': 10,
     'track_max_tentative_age': 3,
     'track_max_distance': 100,
