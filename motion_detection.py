@@ -209,7 +209,7 @@ DEFAULT_CONFIG = {
     'debug_dir': 'data/debug_ema_frames',
 
     # EMA temporal accumulation
-    'ema_alpha': 0.4,
+    'ema_alpha': 0.5,
 
     # Source scaling (upscale before optical flow)
     'source_scale': 1.5,
@@ -267,6 +267,11 @@ DEFAULT_CONFIG = {
     'multi_hypothesis_sigmas': [2.0, 2.5, 3.0, 3.5, 4.0],
     'hypothesis_merge_iou': 0.5,
     'sigma_weights': {2.0: 0.5, 2.5: 0.7, 3.0: 1.0, 3.5: 1.2, 4.0: 1.5},
+
+    # Post-processing: bbox filtering and merging
+    'enable_bbox_filtering': True,
+    'bbox_containment_threshold': 0.95,  # If bbox A is 85%+ inside bbox B, remove A
+    'bbox_merge_iou_threshold': 0.5,     # Merge boxes with IoU > 50%
 }
 
 
@@ -859,6 +864,157 @@ def tracks_to_detections(tracks: List[Track]) -> List[Dict]:
     return detections
 
 
+def filter_contained_and_merge_overlapping(detections: List[Dict],
+                                            containment_threshold: float = 0.85,
+                                            merge_iou_threshold: float = 0.5) -> List[Dict]:
+    """
+    Filter out detections contained within larger ones and merge overlapping detections.
+
+    Args:
+        detections: List of detection dictionaries with 'bbox' key
+        containment_threshold: If bbox A has this fraction inside bbox B, remove A
+        merge_iou_threshold: Merge boxes with IoU above this threshold
+
+    Returns:
+        Filtered and merged list of detections
+    """
+    if len(detections) <= 1:
+        return detections
+
+    def compute_iou(bbox1: Tuple, bbox2: Tuple) -> float:
+        """Compute IoU between two bboxes (x, y, w, h)."""
+        x1, y1, w1, h1 = bbox1
+        x2, y2, w2, h2 = bbox2
+
+        xi1 = max(x1, x2)
+        yi1 = max(y1, y2)
+        xi2 = min(x1 + w1, x2 + w2)
+        yi2 = min(y1 + h1, y2 + h2)
+
+        inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
+        union_area = w1 * h1 + w2 * h2 - inter_area
+
+        if union_area <= 0:
+            return 0.0
+        return inter_area / union_area
+
+    def compute_containment(inner_bbox: Tuple, outer_bbox: Tuple) -> float:
+        """
+        Compute what fraction of inner_bbox is contained within outer_bbox.
+        Returns value between 0 and 1.
+        """
+        x1, y1, w1, h1 = inner_bbox
+        x2, y2, w2, h2 = outer_bbox
+
+        # Compute intersection
+        xi1 = max(x1, x2)
+        yi1 = max(y1, y2)
+        xi2 = min(x1 + w1, x2 + w2)
+        yi2 = min(y1 + h1, y2 + h2)
+
+        inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
+        inner_area = w1 * h1
+
+        if inner_area <= 0:
+            return 0.0
+        return inter_area / inner_area
+
+    def merge_two_detections(det1: Dict, det2: Dict) -> Dict:
+        """Merge two detections into one, keeping the larger/more confident one's metadata."""
+        bbox1 = det1['bbox']
+        bbox2 = det2['bbox']
+        area1 = bbox1[2] * bbox1[3]
+        area2 = bbox2[2] * bbox2[3]
+
+        # Compute merged bounding box (union)
+        x1 = min(bbox1[0], bbox2[0])
+        y1 = min(bbox1[1], bbox2[1])
+        x2 = max(bbox1[0] + bbox1[2], bbox2[0] + bbox2[2])
+        y2 = max(bbox1[1] + bbox1[3], bbox2[1] + bbox2[3])
+        merged_bbox = (x1, y1, x2 - x1, y2 - y1)
+
+        # Keep metadata from the larger/more confident detection
+        conf1 = det1.get('confidence', det1.get('track_confidence', 0))
+        conf2 = det2.get('confidence', det2.get('track_confidence', 0))
+
+        if conf1 > conf2 or (conf1 == conf2 and area1 >= area2):
+            primary = det1
+        else:
+            primary = det2
+
+        # Create merged detection
+        merged = primary.copy()
+        merged['bbox'] = merged_bbox
+        merged['centroid'] = (x1 + (x2 - x1) // 2, y1 + (y2 - y1) // 2)
+        merged['area'] = (x2 - x1) * (y2 - y1)
+
+        return merged
+
+    # Step 1: Remove detections that are mostly contained within larger ones
+    # Sort by area (largest first)
+    sorted_by_area = sorted(enumerate(detections),
+                            key=lambda x: x[1]['bbox'][2] * x[1]['bbox'][3],
+                            reverse=True)
+
+    contained_indices = set()
+    for i, (idx_i, det_i) in enumerate(sorted_by_area):
+        if idx_i in contained_indices:
+            continue
+        bbox_i = det_i['bbox']
+
+        # Check if smaller boxes are contained within this one
+        for idx_j, det_j in sorted_by_area[i+1:]:
+            if idx_j in contained_indices:
+                continue
+            bbox_j = det_j['bbox']
+
+            containment = compute_containment(bbox_j, bbox_i)
+            if containment >= containment_threshold:
+                contained_indices.add(idx_j)
+
+    # Filter out contained detections
+    filtered = [det for i, det in enumerate(detections) if i not in contained_indices]
+
+    if len(filtered) <= 1:
+        return filtered
+
+    # Step 2: Merge overlapping detections
+    merged_detections = []
+    used = set()
+
+    for i, det_i in enumerate(filtered):
+        if i in used:
+            continue
+
+        # Find all detections that overlap with this one
+        cluster = [det_i]
+        used.add(i)
+
+        for j, det_j in enumerate(filtered):
+            if j in used:
+                continue
+
+            # Check IoU with any detection in the cluster
+            for det_c in cluster:
+                iou = compute_iou(det_c['bbox'], det_j['bbox'])
+                if iou >= merge_iou_threshold:
+                    cluster.append(det_j)
+                    used.add(j)
+                    break
+
+        # Merge all detections in the cluster
+        if len(cluster) == 1:
+            merged_detections.append(cluster[0])
+        else:
+            # Progressively merge detections
+            merged = cluster[0]
+            for det in cluster[1:]:
+                merged = merge_two_detections(merged, det)
+            merged_detections.append(merged)
+
+    return merged_detections
+
+
 # ============================================
 # Multi-Scale Pyramid Functions
 # ============================================
@@ -1323,6 +1479,10 @@ def process_video(input_path: str, config: Config, debug: bool = False,
     print(f"EMA alpha: {config.ema_alpha}")
     print(f"Tracking: {'ENABLED' if config.enable_tracking else 'DISABLED'}")
     print(f"Multi-hypothesis: {'ENABLED' if config.enable_multi_hypothesis else 'DISABLED'}")
+    print(f"BBox filtering: {'ENABLED' if config.enable_bbox_filtering else 'DISABLED'}")
+    if config.enable_bbox_filtering:
+        print(f"  Containment threshold: {config.bbox_containment_threshold}")
+        print(f"  Merge IoU threshold: {config.bbox_merge_iou_threshold}")
     print(f"Save frames: {'ENABLED' if save_frames else 'DISABLED'}")
     if save_frames:
         print(f"  Output dir: {config.output_dir}")
@@ -1396,6 +1556,14 @@ def process_video(input_path: str, config: Config, debug: bool = False,
                     total_tracked_frames += len(active_tracks)
                 else:
                     output_detections = detections
+
+                # Post-process: filter contained boxes and merge overlapping ones
+                if config.enable_bbox_filtering and len(output_detections) > 1:
+                    output_detections = filter_contained_and_merge_overlapping(
+                        output_detections,
+                        containment_threshold=config.bbox_containment_threshold,
+                        merge_iou_threshold=config.bbox_merge_iou_threshold
+                    )
 
                 # Write detections to CSV if enabled
                 if csv_writer is not None:
@@ -1600,6 +1768,14 @@ CSV output columns:
     parser.add_argument('--max-area', type=int, default=50000,
                         help='Maximum detection area (default: 50000)')
 
+    # BBox filtering options
+    parser.add_argument('--no-bbox-filtering', action='store_true',
+                        help='Disable bounding box filtering and merging')
+    parser.add_argument('--bbox-containment', type=float, default=0.85,
+                        help='Containment threshold for nested bbox removal (default: 0.85)')
+    parser.add_argument('--bbox-merge-iou', type=float, default=0.5,
+                        help='IoU threshold for merging overlapping boxes (default: 0.5)')
+
     args = parser.parse_args()
 
     # Build config from arguments
@@ -1615,6 +1791,9 @@ CSV output columns:
         base_threshold_sigma=args.base_threshold_sigma,
         base_min_area=args.min_area,
         base_max_area=args.max_area,
+        enable_bbox_filtering=not args.no_bbox_filtering,
+        bbox_containment_threshold=args.bbox_containment,
+        bbox_merge_iou_threshold=args.bbox_merge_iou,
     )
 
     # Process input (video or image sequence)
