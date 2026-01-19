@@ -271,7 +271,7 @@ DEFAULT_CONFIG = {
     # Post-processing: bbox filtering and merging
     'enable_bbox_filtering': True,
     'bbox_containment_threshold': 0.95,  # If bbox A is 85%+ inside bbox B, remove A
-    'bbox_merge_iou_threshold': 0.5,     # Merge boxes with IoU > 50%
+    'bbox_merge_iou_threshold': 0.3,     # Merge boxes with IoU > 50%
 }
 
 
@@ -1267,6 +1267,7 @@ def process_multiscale_pyramid(residual: np.ndarray, valid_mask: np.ndarray,
             'params': params,
             'threshold': thresh,
             'detections': len(detections),
+            'detections_before_merge': len(scaled_detections),
             'mask': mask
         })
 
